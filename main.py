@@ -72,14 +72,31 @@ async def import_json(file: UploadFile = File(...)):
 
 @app.get("/stream")
 async def stream_audio(url: str):
-    """Proxy audio stream to bypass CORS restrictions"""
+    """Extract and stream TikTok audio with correct content-type"""
     try:
-        response = requests.get(url, stream=True, timeout=30)
+        # Re-extract fresh audio URL from TikTok URL using yt-dlp
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'best[ext=mp4]'
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        
+        audio_url = info.get('url', '')
+        if not audio_url:
+            return {"error": "Could not extract audio URL from TikTok"}
+        
+        # Fetch the audio stream with original content-type
+        response = requests.get(audio_url, stream=True, timeout=30)
         response.raise_for_status()
+        
+        # Use correct content-type (MP4/AAC audio from TikTok)
+        content_type = response.headers.get('content-type', 'video/mp4')
         
         return StreamingResponse(
             response.iter_content(chunk_size=8192),
-            media_type="audio/mpeg",
+            media_type=content_type,
             headers={"Content-Disposition": "inline"}
         )
     except Exception as e:
