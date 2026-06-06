@@ -1,9 +1,11 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import yt_dlp
 import json
 from pydantic import BaseModel
 from typing import List
+import requests
 
 app = FastAPI()
 
@@ -67,6 +69,21 @@ async def import_json(file: UploadFile = File(...)):
             ))
     
     return videos
+
+@app.get("/stream")
+async def stream_audio(url: str):
+    """Proxy audio stream to bypass CORS restrictions"""
+    try:
+        response = requests.get(url, stream=True, timeout=30)
+        response.raise_for_status()
+        
+        return StreamingResponse(
+            response.iter_content(chunk_size=8192),
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": "inline"}
+        )
+    except Exception as e:
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
