@@ -1,10 +1,10 @@
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import yt_dlp
 import json
 from pydantic import BaseModel
-from typing import List
+from typing import List, Iterator, Tuple
 import os
 import tempfile
 import mimetypes
@@ -15,9 +15,10 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Accept-Ranges", "Content-Length", "Content-Range"],
 )
 
 # Request/Response Models
@@ -34,6 +35,56 @@ class VideoInfo(BaseModel):
 class ImportedVideo(BaseModel):
     url: str
     title: str
+
+
+def parse_range_header(range_header: str | None, file_size: int) -> Tuple[int, int, bool]:
+    if not range_header:
+        return 0, file_size - 1, False
+
+    if not range_header.startswith("bytes="):
+        raise ValueError("Invalid range header")
+
+    range_value = range_header.replace("bytes=", "", 1).split(",", 1)[0].strip()
+    start_raw, separator, end_raw = range_value.partition("-")
+    if not separator:
+        raise ValueError("Invalid range header")
+
+    if start_raw == "":
+        suffix_length = int(end_raw)
+        if suffix_length <= 0:
+            raise ValueError("Invalid range header")
+        start = max(file_size - suffix_length, 0)
+        end = file_size - 1
+    else:
+        start = int(start_raw)
+        end = int(end_raw) if end_raw else file_size - 1
+        end = min(end, file_size - 1)
+
+    if start < 0 or end < start or start >= file_size:
+        raise ValueError("Invalid range header")
+
+    return start, end, True
+
+
+def iter_file_range(file_path: str, start: int, end: int) -> Iterator[bytes]:
+    with open(file_path, "rb") as file:
+        file.seek(start)
+        remaining = end - start + 1
+        while remaining > 0:
+            chunk = file.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def get_audio_content_type(file_path: str) -> str:
+    extension = os.path.splitext(file_path)[1].lower()
+    if extension in {".m4a", ".mp4"}:
+        return "audio/mp4"
+
+    content_type, _ = mimetypes.guess_type(file_path)
+    return content_type or "audio/mp4"
 
 # Endpoints
 @app.post("/extract", response_model=VideoInfo)
@@ -73,7 +124,7 @@ async def import_json(file: UploadFile = File(...)):
     return videos
 
 @app.get("/stream")
-async def stream_audio(url: str, background_tasks: BackgroundTasks):
+async def stream_audio(url: str, request: Request, background_tasks: BackgroundTasks):
     """Download TikTok audio to a temp file and stream it back to the client"""
     temp_dir = tempfile.TemporaryDirectory()
 
@@ -93,19 +144,45 @@ async def stream_audio(url: str, background_tasks: BackgroundTasks):
             temp_dir.cleanup()
             return {"error": "Failed to download audio from TikTok"}
 
-        content_type, _ = mimetypes.guess_type(file_path)
-        if not content_type:
-            content_type = 'audio/mp4'
+        file_size = os.path.getsize(file_path)
+        content_type = get_audio_content_type(file_path)
 
-        file_handle = open(file_path, 'rb')
-        background_tasks.add_task(file_handle.close)
+        try:
+            start, end, is_partial = parse_range_header(
+                request.headers.get("range"),
+                file_size,
+            )
+        except ValueError:
+            background_tasks.add_task(os.remove, file_path)
+            background_tasks.add_task(temp_dir.cleanup)
+            return Response(
+                status_code=416,
+                headers={
+                    "Content-Range": f"bytes */{file_size}",
+                    "Accept-Ranges": "bytes",
+                },
+                background=background_tasks,
+            )
+
+        content_length = end - start + 1
+        headers = {
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+            "Content-Disposition": "inline",
+        }
+
+        if is_partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
         background_tasks.add_task(os.remove, file_path)
         background_tasks.add_task(temp_dir.cleanup)
 
         return StreamingResponse(
-            file_handle,
+            iter_file_range(file_path, start, end),
+            status_code=206 if is_partial else 200,
             media_type=content_type,
-            headers={"Content-Disposition": "inline"}
+            headers=headers,
+            background=background_tasks,
         )
     except Exception as e:
         temp_dir.cleanup()
