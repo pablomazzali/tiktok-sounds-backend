@@ -55,9 +55,6 @@ SOUND_MARKERS = ("sound", "sounds", "music", "audio")
 EXCLUDED_IMPORT_MARKERS = (
     "comment",
     "comments",
-    "like",
-    "liked",
-    "likes",
     "history",
     "watchhistory",
     "search",
@@ -68,6 +65,7 @@ EXCLUDED_IMPORT_MARKERS = (
     "following",
     "follower",
 )
+EXCLUDED_LIKE_SEGMENTS = ("like", "likes", "liked", "likelist", "likedlist")
 
 
 def clean_tiktok_url(url: str) -> str:
@@ -97,6 +95,12 @@ def is_saved_sound_path(path: tuple[str, ...]) -> bool:
 
     if any(marker in joined_path for marker in EXCLUDED_IMPORT_MARKERS):
         return False
+
+    for segment in normalized_path:
+        if segment in EXCLUDED_LIKE_SEGMENTS or segment.startswith("liked"):
+            return False
+        if segment.startswith("like") and "favorite" not in segment and "favourite" not in segment:
+            return False
 
     has_saved_marker = any(marker in joined_path for marker in SAVED_SOUND_MARKERS)
     has_sound_marker = any(marker in joined_path for marker in SOUND_MARKERS)
