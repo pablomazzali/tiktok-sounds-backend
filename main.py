@@ -433,14 +433,22 @@ async def import_json(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Invalid JSON file.") from e
 
     videos = collect_imported_videos(data)
-    if not videos:
-        diagnostics = collect_import_diagnostics(data)
+    diagnostics = collect_import_diagnostics(data)
+    if videos:
         raise HTTPException(
             status_code=422,
-            detail=f"No saved TikTok sound links were imported. {diagnostics}",
+            detail=(
+                f"Found {len(videos)} saved sound links, but TikTok exports saved sounds as sound pages, "
+                "not playable audio. Import TikTok video/post links with Bulk import instead. "
+                f"{diagnostics}"
+            ),
         )
 
-    return videos
+    raise HTTPException(
+        status_code=422,
+        detail=f"No playable TikTok sound links were imported. {diagnostics}",
+    )
+
 
 
 @app.get("/prepare")
