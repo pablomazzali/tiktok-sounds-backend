@@ -3,8 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import yt_dlp
 import json
+import re
 from pydantic import BaseModel
-from typing import List, Iterator, Tuple
+from typing import Any, List, Iterator, Tuple
 import os
 import tempfile
 import mimetypes
@@ -43,6 +44,60 @@ class VideoInfo(BaseModel):
 class ImportedVideo(BaseModel):
     url: str
     title: str
+
+TIKTOK_URL_PATTERN = re.compile(r"https?://(?:[\w.-]+\.)?tiktok\.com/[^\s\"'<>]+", re.IGNORECASE)
+
+
+def clean_tiktok_url(url: str) -> str:
+    return url.strip().rstrip(").,;]}")
+
+
+def get_import_title(item: dict[str, Any]) -> str:
+    for key in ("Desc", "desc", "Description", "description", "Title", "title", "name"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    return ""
+
+
+def collect_imported_videos(data: Any) -> List[ImportedVideo]:
+    videos: List[ImportedVideo] = []
+    seen: set[str] = set()
+
+    def add_video(url: str, title: str = "") -> None:
+        cleaned_url = clean_tiktok_url(url)
+        if not cleaned_url or cleaned_url in seen:
+            return
+
+        seen.add(cleaned_url)
+        videos.append(ImportedVideo(url=cleaned_url, title=title.strip()))
+
+    def walk(value: Any, title_hint: str = "") -> None:
+        if isinstance(value, dict):
+            title = get_import_title(value) or title_hint
+
+            for key in ("Link", "link", "Url", "URL", "url", "VideoLink", "videoLink", "shareUrl", "share_url"):
+                candidate = value.get(key)
+                if isinstance(candidate, str):
+                    for match in TIKTOK_URL_PATTERN.findall(candidate):
+                        add_video(match, title)
+
+            for nested in value.values():
+                walk(nested, title)
+            return
+
+        if isinstance(value, list):
+            for item in value:
+                walk(item, title_hint)
+            return
+
+        if isinstance(value, str):
+            for match in TIKTOK_URL_PATTERN.findall(value):
+                add_video(match, title_hint)
+
+    walk(data)
+    return videos
 
 
 def get_cache_key(url: str) -> str:
@@ -204,17 +259,7 @@ async def import_json(file: UploadFile = File(...)):
     """Import TikTok videos from JSON export"""
     content = await file.read()
     data = json.loads(content)
-    videos = []
-    
-    # Parse TikTok export JSON format
-    if 'Video' in data:
-        for video in data['Video']:
-            videos.append(ImportedVideo(
-                url=video.get('Link', ''),
-                title=video.get('Desc', '')
-            ))
-    
-    return videos
+    return collect_imported_videos(data)
 
 
 @app.get("/prepare")
