@@ -46,11 +46,57 @@ class ImportedVideo(BaseModel):
     url: str
     title: str
 
-TIKTOK_URL_PATTERN = re.compile(r"https?://(?:[\w.-]+\.)?tiktok\.com/[^\s\"'<>]+", re.IGNORECASE)
+TIKTOK_URL_PATTERN = re.compile(
+    r"https?://(?:[\w.-]+\.)?(?:tiktok\.com|tiktokv\.com)/[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+SAVED_SOUND_MARKERS = ("favorite", "favourite", "saved", "bookmark")
+SOUND_MARKERS = ("sound", "sounds", "music", "audio")
+EXCLUDED_IMPORT_MARKERS = (
+    "comment",
+    "comments",
+    "like",
+    "liked",
+    "likes",
+    "history",
+    "watchhistory",
+    "search",
+    "sharehistory",
+    "message",
+    "messages",
+    "directmessage",
+    "following",
+    "follower",
+)
 
 
 def clean_tiktok_url(url: str) -> str:
     return url.strip().rstrip(").,;]}")
+
+
+def normalize_import_label(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def is_sound_url(url: str) -> bool:
+    normalized_url = url.lower()
+    return any(
+        marker in normalized_url
+        for marker in ("/music/", "/sound/", "/share/music/", "/share/sound/", "/h5/share/music/")
+    )
+
+
+def is_saved_sound_path(path: tuple[str, ...]) -> bool:
+    normalized_path = tuple(normalize_import_label(part) for part in path)
+    joined_path = "".join(normalized_path)
+
+    if any(marker in joined_path for marker in EXCLUDED_IMPORT_MARKERS):
+        return False
+
+    has_saved_marker = any(marker in joined_path for marker in SAVED_SOUND_MARKERS)
+    has_sound_marker = any(marker in joined_path for marker in SOUND_MARKERS)
+
+    return has_saved_marker and has_sound_marker
 
 
 def get_import_title(item: dict[str, Any]) -> str:
@@ -66,15 +112,18 @@ def collect_imported_videos(data: Any) -> List[ImportedVideo]:
     videos: List[ImportedVideo] = []
     seen: set[str] = set()
 
-    def add_video(url: str, title: str = "") -> None:
+    def add_video(url: str, title: str = "", path: tuple[str, ...] = ()) -> None:
         cleaned_url = clean_tiktok_url(url)
         if not cleaned_url or cleaned_url in seen:
+            return
+
+        if not is_saved_sound_path(path) or not is_sound_url(cleaned_url):
             return
 
         seen.add(cleaned_url)
         videos.append(ImportedVideo(url=cleaned_url, title=title.strip()))
 
-    def walk(value: Any, title_hint: str = "") -> None:
+    def walk(value: Any, title_hint: str = "", path: tuple[str, ...] = ()) -> None:
         if isinstance(value, dict):
             title = get_import_title(value) or title_hint
 
@@ -82,20 +131,20 @@ def collect_imported_videos(data: Any) -> List[ImportedVideo]:
                 candidate = value.get(key)
                 if isinstance(candidate, str):
                     for match in TIKTOK_URL_PATTERN.findall(candidate):
-                        add_video(match, title)
+                        add_video(match, title, (*path, key))
 
-            for nested in value.values():
-                walk(nested, title)
+            for key, nested in value.items():
+                walk(nested, title, (*path, str(key)))
             return
 
         if isinstance(value, list):
             for item in value:
-                walk(item, title_hint)
+                walk(item, title_hint, path)
             return
 
         if isinstance(value, str):
             for match in TIKTOK_URL_PATTERN.findall(value):
-                add_video(match, title_hint)
+                add_video(match, title_hint, path)
 
     walk(data)
     return videos
@@ -311,7 +360,7 @@ async def import_json(file: UploadFile = File(...)):
 
     videos = collect_imported_videos(data)
     if not videos:
-        raise HTTPException(status_code=422, detail="No TikTok links were found in this JSON file.")
+        raise HTTPException(status_code=422, detail="No saved TikTok sound links were found in this JSON file.")
 
     return videos
 
