@@ -13,12 +13,15 @@ import hashlib
 import glob
 import time
 import shutil
+import requests
+from urllib.parse import urlparse
 
 app = FastAPI()
 
 CACHE_TTL_SECONDS = 60 * 15
 AUDIO_CACHE_DIR = os.path.join(tempfile.gettempdir(), "mitok-audio-cache")
 AUDIO_FORMAT_SELECTOR = "bestaudio[ext=m4a]/bestaudio/best[ext=mp4]/best"
+SOUND_PAGE_ERROR = "TikTok sound links are catalog pages, not directly playable audio. Import a TikTok video/post link that uses this sound."
 
 # Enable CORS for all origins
 app.add_middleware(
@@ -82,6 +85,35 @@ def is_sound_url(url: str) -> bool:
         marker in normalized_url
         for marker in ("/music/", "/sound/", "/share/music/", "/share/sound/", "/h5/share/music/")
     )
+
+
+def is_tiktok_short_url(url: str) -> bool:
+    hostname = urlparse(url).netloc.lower()
+    return hostname in {"vm.tiktok.com", "vt.tiktok.com"}
+
+
+def resolve_tiktok_url(url: str) -> str:
+    if is_sound_url(url):
+        raise ValueError(SOUND_PAGE_ERROR)
+
+    if not is_tiktok_short_url(url):
+        return url
+
+    response = requests.get(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+        },
+        allow_redirects=True,
+        timeout=12,
+    )
+    response.raise_for_status()
+
+    resolved_url = response.url
+    if is_sound_url(resolved_url):
+        raise ValueError(SOUND_PAGE_ERROR)
+
+    return resolved_url
 
 
 def is_video_url(url: str) -> bool:
@@ -252,6 +284,7 @@ def find_downloaded_file(info: dict[str, Any], temp_dir: str, expected_path: str
 
 
 def extract_media_info(url: str, download: bool = False) -> dict[str, Any]:
+    url = resolve_tiktok_url(url)
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -290,6 +323,7 @@ def get_cached_audio_path(url: str) -> str | None:
 
 
 def download_audio_to_cache(url: str) -> str:
+    url = resolve_tiktok_url(url)
     cached_path = get_cached_audio_path(url)
     if cached_path:
         return cached_path
@@ -400,6 +434,8 @@ async def extract_tiktok(request: URLRequest):
     """Extract TikTok metadata from URL"""
     try:
         info = extract_media_info(request.url, download=False)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(
             status_code=422,
@@ -507,7 +543,11 @@ async def stream_audio(url: str, request: Request, background_tasks: BackgroundT
             background=background_tasks,
         )
     except Exception as e:
-        return {"error": str(e)}
+        return Response(
+            content=json.dumps({"error": str(e)}),
+            status_code=422,
+            media_type="application/json",
+        )
 
 if __name__ == "__main__":
     import uvicorn
