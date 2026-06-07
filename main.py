@@ -86,6 +86,11 @@ def is_sound_url(url: str) -> bool:
     )
 
 
+def is_video_url(url: str) -> bool:
+    normalized_url = url.lower()
+    return any(marker in normalized_url for marker in ("/video/", "/photo/", "/share/video/"))
+
+
 def is_saved_sound_path(path: tuple[str, ...]) -> bool:
     normalized_path = tuple(normalize_import_label(part) for part in path)
     joined_path = "".join(normalized_path)
@@ -97,6 +102,71 @@ def is_saved_sound_path(path: tuple[str, ...]) -> bool:
     has_sound_marker = any(marker in joined_path for marker in SOUND_MARKERS)
 
     return has_saved_marker and has_sound_marker
+
+
+def format_import_path(path: tuple[str, ...]) -> str:
+    return " > ".join(part for part in path if part)
+
+
+def collect_import_diagnostics(data: Any) -> str:
+    candidates: dict[tuple[str, ...], dict[str, int]] = {}
+
+    def register(path: tuple[str, ...], url: str) -> None:
+        parent_path = path[:-1] if path and normalize_import_label(path[-1]) in {"link", "url", "videolink", "shareurl"} else path
+        bucket = candidates.setdefault(parent_path, {"sound": 0, "video": 0, "other": 0})
+
+        if is_sound_url(url):
+            bucket["sound"] += 1
+        elif is_video_url(url):
+            bucket["video"] += 1
+        else:
+            bucket["other"] += 1
+
+    def walk(value: Any, path: tuple[str, ...] = ()) -> None:
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                walk(nested, (*path, str(key)))
+            return
+
+        if isinstance(value, list):
+            for item in value:
+                walk(item, path)
+            return
+
+        if isinstance(value, str):
+            for match in TIKTOK_URL_PATTERN.findall(value):
+                register(path, clean_tiktok_url(match))
+
+    walk(data)
+
+    interesting = [
+        (path, counts)
+        for path, counts in candidates.items()
+        if counts["sound"] or any(marker in normalize_import_label(format_import_path(path)) for marker in SOUND_MARKERS)
+    ]
+
+    if not interesting:
+        total_links = sum(sum(counts.values()) for counts in candidates.values())
+        return f"No sound/music sections were found. TikTok links found elsewhere: {total_links}."
+
+    interesting.sort(
+        key=lambda item: (item[1]["sound"], item[1]["video"], item[1]["other"]),
+        reverse=True,
+    )
+
+    lines = []
+    for path, counts in interesting[:5]:
+        parts = []
+        if counts["sound"]:
+            parts.append(f"{counts['sound']} sound links")
+        if counts["video"]:
+            parts.append(f"{counts['video']} video links")
+        if counts["other"]:
+            parts.append(f"{counts['other']} other TikTok links")
+
+        lines.append(f"{format_import_path(path) or 'root'} ({', '.join(parts)})")
+
+    return "Possible sections found: " + "; ".join(lines)
 
 
 def get_import_title(item: dict[str, Any]) -> str:
@@ -360,7 +430,11 @@ async def import_json(file: UploadFile = File(...)):
 
     videos = collect_imported_videos(data)
     if not videos:
-        raise HTTPException(status_code=422, detail="No saved TikTok sound links were found in this JSON file.")
+        diagnostics = collect_import_diagnostics(data)
+        raise HTTPException(
+            status_code=422,
+            detail=f"No saved TikTok sound links were imported. {diagnostics}",
+        )
 
     return videos
 
