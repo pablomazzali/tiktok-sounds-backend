@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request, Response
+from fastapi import FastAPI, File, UploadFile, BackgroundTasks, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import yt_dlp
@@ -18,6 +18,7 @@ app = FastAPI()
 
 CACHE_TTL_SECONDS = 60 * 15
 AUDIO_CACHE_DIR = os.path.join(tempfile.gettempdir(), "mitok-audio-cache")
+AUDIO_FORMAT_SELECTOR = "bestaudio[ext=m4a]/bestaudio/best[ext=mp4]/best"
 
 # Enable CORS for all origins
 app.add_middleware(
@@ -104,6 +105,42 @@ def get_cache_key(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
+def find_downloaded_file(info: dict[str, Any], temp_dir: str, expected_path: str) -> str | None:
+    requested_downloads = info.get("requested_downloads") or []
+    for download in requested_downloads:
+        file_path = download.get("filepath")
+        if isinstance(file_path, str) and os.path.exists(file_path):
+            return file_path
+
+    if os.path.exists(expected_path):
+        return expected_path
+
+    candidates: list[str] = []
+    for root, _, files in os.walk(temp_dir):
+        for file_name in files:
+            file_path = os.path.join(root, file_name)
+            if os.path.isfile(file_path):
+                candidates.append(file_path)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda path: os.path.getsize(path))
+
+
+def extract_media_info(url: str, download: bool = False) -> dict[str, Any]:
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": AUDIO_FORMAT_SELECTOR,
+        "noplaylist": True,
+        "ignore_no_formats_error": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=download)
+
+
 def cleanup_audio_cache() -> None:
     os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
     now = time.time()
@@ -142,15 +179,18 @@ def download_audio_to_cache(url: str) -> str:
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': AUDIO_FORMAT_SELECTOR,
+            'noplaylist': True,
+            'ignore_no_formats_error': True,
             'outtmpl': os.path.join(temp_dir.name, '%(id)s.%(ext)s')
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            downloaded_path = ydl.prepare_filename(info)
+            expected_path = ydl.prepare_filename(info)
+            downloaded_path = find_downloaded_file(info, temp_dir.name, expected_path)
 
-        if not os.path.exists(downloaded_path):
+        if not downloaded_path or not os.path.exists(downloaded_path):
             raise FileNotFoundError("Failed to download audio from TikTok")
 
         extension = os.path.splitext(downloaded_path)[1] or ".mp4"
@@ -235,20 +275,26 @@ def get_thumbnail_url(info: dict) -> str:
 @app.post("/extract", response_model=VideoInfo)
 async def extract_tiktok(request: URLRequest):
     """Extract TikTok metadata from URL"""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'format': 'best[ext=mp4]'
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(request.url, download=False)
+    try:
+        info = extract_media_info(request.url, download=False)
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Could not read this TikTok link. Try sharing the original post link instead. ({str(e)})",
+        ) from e
+
+    if not info:
+        raise HTTPException(
+            status_code=422,
+            detail="Could not read this TikTok link. Try sharing the original post link instead.",
+        )
     
     thumbnail_url = get_thumbnail_url(info)
 
     return VideoInfo(
         title=info.get('title', 'Unknown'),
         creator=info.get('uploader', 'Unknown'),
-        duration=info.get('duration', 0),
+        duration=info.get('duration') or 0,
         audioUrl=info.get('url', ''),
         thumbnailUrl=thumbnail_url,
         coverArt=thumbnail_url
@@ -257,9 +303,17 @@ async def extract_tiktok(request: URLRequest):
 @app.post("/import-json", response_model=List[ImportedVideo])
 async def import_json(file: UploadFile = File(...)):
     """Import TikTok videos from JSON export"""
-    content = await file.read()
-    data = json.loads(content)
-    return collect_imported_videos(data)
+    try:
+        content = await file.read()
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail="Invalid JSON file.") from e
+
+    videos = collect_imported_videos(data)
+    if not videos:
+        raise HTTPException(status_code=422, detail="No TikTok links were found in this JSON file.")
+
+    return videos
 
 
 @app.get("/prepare")
