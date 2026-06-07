@@ -18,7 +18,7 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Accept-Ranges", "Content-Length", "Content-Range"],
+    expose_headers=["Accept-Ranges", "Content-Length", "Content-Range", "Cache-Control"],
 )
 
 # Request/Response Models
@@ -31,6 +31,7 @@ class VideoInfo(BaseModel):
     duration: int
     audioUrl: str
     thumbnailUrl: str
+    coverArt: str
 
 class ImportedVideo(BaseModel):
     url: str
@@ -98,12 +99,15 @@ async def extract_tiktok(request: URLRequest):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(request.url, download=False)
     
+    thumbnail_url = info.get('thumbnail', '')
+
     return VideoInfo(
         title=info.get('title', 'Unknown'),
         creator=info.get('uploader', 'Unknown'),
         duration=info.get('duration', 0),
         audioUrl=info.get('url', ''),
-        thumbnailUrl=info.get('thumbnail', '')
+        thumbnailUrl=thumbnail_url,
+        coverArt=thumbnail_url
     )
 
 @app.post("/import-json", response_model=List[ImportedVideo])
@@ -169,6 +173,7 @@ async def stream_audio(url: str, request: Request, background_tasks: BackgroundT
             "Accept-Ranges": "bytes",
             "Content-Length": str(content_length),
             "Content-Disposition": "inline",
+            "Cache-Control": "private, max-age=900",
         }
 
         if is_partial:
