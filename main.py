@@ -8,8 +8,15 @@ from typing import List, Iterator, Tuple
 import os
 import tempfile
 import mimetypes
+import hashlib
+import glob
+import time
+import shutil
 
 app = FastAPI()
+
+CACHE_TTL_SECONDS = 60 * 15
+AUDIO_CACHE_DIR = os.path.join(tempfile.gettempdir(), "mitok-audio-cache")
 
 # Enable CORS for all origins
 app.add_middleware(
@@ -36,6 +43,71 @@ class VideoInfo(BaseModel):
 class ImportedVideo(BaseModel):
     url: str
     title: str
+
+
+def get_cache_key(url: str) -> str:
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+
+def cleanup_audio_cache() -> None:
+    os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+    now = time.time()
+
+    for file_path in glob.glob(os.path.join(AUDIO_CACHE_DIR, "*")):
+        try:
+            if os.path.isfile(file_path) and now - os.path.getmtime(file_path) > CACHE_TTL_SECONDS:
+                os.remove(file_path)
+        except OSError:
+            pass
+
+
+def get_cached_audio_path(url: str) -> str | None:
+    cleanup_audio_cache()
+    cache_key = get_cache_key(url)
+    matches = glob.glob(os.path.join(AUDIO_CACHE_DIR, f"{cache_key}.*"))
+
+    for file_path in matches:
+        if os.path.isfile(file_path):
+            os.utime(file_path, None)
+            return file_path
+
+    return None
+
+
+def download_audio_to_cache(url: str) -> str:
+    cached_path = get_cached_audio_path(url)
+    if cached_path:
+        return cached_path
+
+    os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+    cache_key = get_cache_key(url)
+    temp_dir = tempfile.TemporaryDirectory()
+
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': os.path.join(temp_dir.name, '%(id)s.%(ext)s')
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            downloaded_path = ydl.prepare_filename(info)
+
+        if not os.path.exists(downloaded_path):
+            raise FileNotFoundError("Failed to download audio from TikTok")
+
+        extension = os.path.splitext(downloaded_path)[1] or ".mp4"
+        cached_path = os.path.join(AUDIO_CACHE_DIR, f"{cache_key}{extension}")
+        existing_path = get_cached_audio_path(url)
+        if existing_path:
+            return existing_path
+
+        shutil.move(downloaded_path, cached_path)
+        return cached_path
+    finally:
+        temp_dir.cleanup()
 
 
 def parse_range_header(range_header: str | None, file_size: int) -> Tuple[int, int, bool]:
@@ -87,6 +159,23 @@ def get_audio_content_type(file_path: str) -> str:
     content_type, _ = mimetypes.guess_type(file_path)
     return content_type or "audio/mp4"
 
+
+def get_thumbnail_url(info: dict) -> str:
+    if info.get('thumbnail'):
+        return info.get('thumbnail', '')
+
+    thumbnails = info.get('thumbnails') or []
+    if not thumbnails:
+        return ''
+
+    sorted_thumbnails = sorted(
+        thumbnails,
+        key=lambda item: item.get('width', 0) * item.get('height', 0),
+        reverse=True,
+    )
+
+    return sorted_thumbnails[0].get('url', '')
+
 # Endpoints
 @app.post("/extract", response_model=VideoInfo)
 async def extract_tiktok(request: URLRequest):
@@ -99,7 +188,7 @@ async def extract_tiktok(request: URLRequest):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(request.url, download=False)
     
-    thumbnail_url = info.get('thumbnail', '')
+    thumbnail_url = get_thumbnail_url(info)
 
     return VideoInfo(
         title=info.get('title', 'Unknown'),
@@ -127,26 +216,25 @@ async def import_json(file: UploadFile = File(...)):
     
     return videos
 
+
+@app.get("/prepare")
+async def prepare_audio(url: str):
+    """Warm the short-lived server cache so playback starts faster later."""
+    try:
+        file_path = download_audio_to_cache(url)
+        return {
+            "ready": True,
+            "contentType": get_audio_content_type(file_path),
+            "cacheTtlSeconds": CACHE_TTL_SECONDS,
+        }
+    except Exception as e:
+        return {"ready": False, "error": str(e)}
+
 @app.get("/stream")
 async def stream_audio(url: str, request: Request, background_tasks: BackgroundTasks):
     """Download TikTok audio to a temp file and stream it back to the client"""
-    temp_dir = tempfile.TemporaryDirectory()
-
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'format': 'bestaudio[ext=m4a]/best[ext=mp4]/best',
-            'outtmpl': os.path.join(temp_dir.name, '%(id)s.%(ext)s')
-        }
-
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            file_path = ydl.prepare_filename(info)
-
-        if not os.path.exists(file_path):
-            temp_dir.cleanup()
-            return {"error": "Failed to download audio from TikTok"}
+        file_path = download_audio_to_cache(url)
 
         file_size = os.path.getsize(file_path)
         content_type = get_audio_content_type(file_path)
@@ -157,8 +245,6 @@ async def stream_audio(url: str, request: Request, background_tasks: BackgroundT
                 file_size,
             )
         except ValueError:
-            background_tasks.add_task(os.remove, file_path)
-            background_tasks.add_task(temp_dir.cleanup)
             return Response(
                 status_code=416,
                 headers={
@@ -179,9 +265,6 @@ async def stream_audio(url: str, request: Request, background_tasks: BackgroundT
         if is_partial:
             headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
 
-        background_tasks.add_task(os.remove, file_path)
-        background_tasks.add_task(temp_dir.cleanup)
-
         return StreamingResponse(
             iter_file_range(file_path, start, end),
             status_code=206 if is_partial else 200,
@@ -190,7 +273,6 @@ async def stream_audio(url: str, request: Request, background_tasks: BackgroundT
             background=background_tasks,
         )
     except Exception as e:
-        temp_dir.cleanup()
         return {"error": str(e)}
 
 if __name__ == "__main__":
